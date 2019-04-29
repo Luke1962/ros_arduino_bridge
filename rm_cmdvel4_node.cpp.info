@@ -1,0 +1,1100 @@
+/*
+	muove il robot in base a  /cmd_vel
+	subscribe: /cmd_vel, /imu , /initialpose
+	publish: /r pir, bump, /odom (se abilitato nel launch)
+
+	NUOVA VERSIONE CHE USA  DC MOTORS E PUBBLICA VERSO I PID LA TARGET VELOCITY
+	*  
+	*  LE NUOVE DISPOSIZIONI DEI PIN MOTORI
+	E LA SCHEDA GPIOEXPANDER PER IL PILOTAGGIO DEI LED
+
+	tratto da http://wiki.ros.org/navigation/Tutorials/RobotSetup/Odom
+	
+	
+
+	Nota per dynamic reconfigure
+	Eventualmente copia a mano cfg/cpp/rm_robot/RobotConfig.h in "/home/pi/ros_catkin_ws/devel/include/rm_robot/robotConfig.h
+		cp /home/pi/ros_catkin_ws/src/myrobotmaster/src/rm_robot/cfg/cpp/rm_pwm/RobotConfig.h /home/pi/ros_catkin_ws/devel/include/rm_robot/robotConfig.h
+
+	Note di sviluppo
+	build : catkin_make  -DCATKIN_WHITELIST_PACKAGES="rm_robot"
+	run: roslaunch rm_robot rm_cmdvel.launch
+
+	per modificare da remoto con VScode
+	1: abilitare ssh su pi3 :sudo systemctl start ssh
+	2: collegarsi a Pi3 con terminale
+	2: nel PC montare la cartella con: sshfs -p2222 pi@192.168.0.50:/home/pi/ros_catkin_ws  /mnt/remotePi3
+	3: lancia VScode 
+	
+*/
+ 
+
+#define NODENAME "rm_cmdvel_node"
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+///	MACRO
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+#define sign(x) (x>=0?1:-1)
+#define getmax(a,b) a>b?a:b
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+///	INCLUDES
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+#if 1
+
+	#include <ros/ros.h>
+	#include <tf/transform_datatypes.h> // richiesto da matrix3x3
+	#include <geometry_msgs/Pose2D.h>  //replaces #include <lino_msgs/Velocities.h>
+	#include <geometry_msgs/TransformStamped.h>
+	#include <geometry_msgs/Twist.h>
+//	#include <geometry_msgs/PoseWithCovarianceStamped.h>		// per InitialPose
+	#include <std_msgs/Float64.h>
+	#include <std_msgs/Float32.h>
+	#include <std_msgs/Int32.h>
+
+//	#include <tf2_ros/transform_broadcaster.h>
+//	#include <tf2_ros/transform_listener.h>
+//	#include <tf2_ros/static_transform_broadcaster.h> //#include <tf2_ros/transform_broadcaster.h>
+//	#include <nav_msgs/Odometry.h>
+
+//	#include <sensor_msgs/Imu.h>
+
+	#include <math.h> /// per fabs()
+	#include <stdlib.h>
+
+//	#include "wiringPi.h"
+	#include <wiringSerial.h>
+	#include <wiringPi.h>
+	#include <softTone.h>
+	//~ #include <pigpio.h>
+	//#include "softTone.h"
+
+	// include miei
+	#include <dbg.h>
+	#include "parameters.h"
+	#include "hw_config2.hpp"
+	#include "MyRobotModelSmall.h"
+
+
+
+
+//	#define	MAX_PINS	64
+//	#define	PULSE_TIME	100
+//	static int freqs         [MAX_PINS] ;
+//	static pthread_t threads [MAX_PINS] ;
+//	static int newPin = -1 ;
+
+
+
+	using namespace std;
+#endif 
+
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// GESTIONE KEYBOARD INPUT NON BLOCCANTE	
+/// ///////////////////////////////////////////////////////////////////
+#if 1	
+	#include <stdlib.h>
+	#include <string.h>
+	#include <unistd.h>
+	#include <sys/select.h>
+	#include <termios.h>
+	
+	struct termios orig_termios;
+	
+	void reset_terminal_mode()
+	{
+	    tcsetattr(0, TCSANOW, &orig_termios);
+	}
+	
+	void set_conio_terminal_mode()
+	{
+	    struct termios new_termios;
+	
+	    /* take two copies - one for now, one for later */
+	    tcgetattr(0, &orig_termios);
+	    memcpy(&new_termios, &orig_termios, sizeof(new_termios));
+	
+	    /* register cleanup handler, and set the new terminal mode */
+	    atexit(reset_terminal_mode);
+	    cfmakeraw(&new_termios);
+	    tcsetattr(0, TCSANOW, &new_termios);
+	}
+	
+	int kbhit()
+	{
+	    struct timeval tv = { 0L, 0L };
+	    fd_set fds;
+	    FD_ZERO(&fds);
+	    FD_SET(0, &fds);
+	    return select(1, &fds, NULL, NULL, &tv);
+	}
+	
+	int getch()
+	{
+	    int r;
+	    unsigned char c;
+	    if ((r = read(0, &c, sizeof(c))) < 0) {
+	        return r;
+	    } else {
+	        return c;
+	    }
+	}
+	
+	// utilizzo:
+	// setup:    set_conio_terminal_mode();
+	//loop:   while (!kbhit()) {	        /* do some work */	    }
+#endif	
+
+
+
+
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+/// DRIVER MOTORI 
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+#include <mydcmotor.h>
+static mydcmotor_c mot_L(MOTOR_LEFT);
+static mydcmotor_c mot_R(MOTOR_RIGTH);
+
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// GPIO EXPANDER 	SparkFunSX1509
+/// ///////////////////////////////////////////////////////////////////
+#if 1	
+	#include "sx1509/SparkFunSX1509.h"
+	
+	#define GPIOEXP_LED_TOP_R 4
+	#define GPIOEXP_LED_TOP_G 5
+	#define GPIOEXP_LED_TOP_B 6
+	
+	#define MAXRETRIES 10
+	auto io = SX1509();
+	const byte SX1509_ADDRESS = 0x3E;  // SX1509 I2C address	
+	
+	int setup_GPIOexp()
+	{
+		io.begin(SX1509_ADDRESS) ;
+		
+		delay(500);
+
+		io.pinMode(GPIOEXP_LED_TOP_R, OUTPUT);
+		io.pinMode(GPIOEXP_LED_TOP_G, OUTPUT);
+		io.pinMode(GPIOEXP_LED_TOP_B, OUTPUT);
+		
+		//~ io.enableInterrupt(SX1509_BUTTON_PIN, FALLING);
+		//~ io.debounceTime(2); //in millisecondi
+		//~ io.debouncePin(SX1509_BUTTON_PIN);
+
+		//~ pinMode(INT_PIN, IN_PULLUP);
+		//~ if ( wiringPiISR (INT_PIN, INT_EDGE_FALLING, &isrfn) < 0 ) {
+			//~ fprintf (stderr, "Unable to setup ISR: %s\n", strerror (errno));
+			//~ return 1;
+		//~ }
+
+		return 0;
+	}
+	
+	
+	//~ // RGB LED connected to pins 13, 14, and 15:
+	//~ const byte SX1509_RED_LED = 13; // Red LED on 13
+	//~ const byte SX1509_GRN_LED = 14; // Green LED on 14
+	//~ const byte SX1509_BLU_PIN = 15; // Blue LED on 15
+
+	void ledBreath(int pin, int low_ms , int high_ms , int rise_ms ,  int fall_ms){
+	  // Set up blue LED:
+	  io.pinMode(pin, ANALOG_OUTPUT);
+	  io.breathe(pin,low_ms ,high_ms,rise_ms , fall_ms);//io.breathe(<pin>, <low_ms>, <high_ms>, <rise_ms>, <fall_ms)
+	}
+
+	#define LEDTOP_R_ON 	io.digitalWrite(GPIOEXP_LED_TOP_R, 1);
+	#define LEDTOP_R_OFF 	io.digitalWrite(GPIOEXP_LED_TOP_R, 0);
+	#define LEDTOP_G_ON 	io.digitalWrite(GPIOEXP_LED_TOP_G, 1);
+	#define LEDTOP_G_OFF 	io.digitalWrite(GPIOEXP_LED_TOP_G, 0);
+	#define LEDTOP_B_ON 	io.digitalWrite(GPIOEXP_LED_TOP_B, 1);
+	#define LEDTOP_B_OFF 	io.digitalWrite(GPIOEXP_LED_TOP_B, 0);
+	#define LEDTOP_ALL_OFF LEDTOP_R_OFF ;LEDTOP_G_OFF; LEDTOP_B_OFF;
+	
+	#define LEDTOP_R_BLINK     io.blink(GPIOEXP_LED_TOP_R, 1000, 500);// Blink the LED pin -- ~1000 ms LOW, ~500 ms HIGH:
+	#define LEDTOP_G_BLINK     io.blink(GPIOEXP_LED_TOP_G, 1000, 500);// Blink the LED pin -- ~1000 ms LOW, ~500 ms HIGH:
+	#define LEDTOP_B_BLINK     io.blink(GPIOEXP_LED_TOP_B, 1000, 500);// Blink the LED pin -- ~1000 ms LOW, ~500 ms HIGH:
+
+	#define LEDTOP_R_BREATH    ledBreath(GPIOEXP_LED_TOP_R, 1000 , 300 ,100 ,  900)
+ 	#define LEDTOP_G_BREATH    ledBreath(GPIOEXP_LED_TOP_G, 1000 , 300 ,100 ,  900)
+	#define LEDTOP_B_BREATH    ledBreath(GPIOEXP_LED_TOP_B, 1000 , 300 ,100 ,  900)
+ 	
+ 	
+ 	
+ 	void led_test(){
+		LEDTOP_R_ON; delay(1000) ;LEDTOP_R_OFF;  	
+		LEDTOP_G_ON; delay(1000) ;LEDTOP_G_OFF; 
+		LEDTOP_B_ON; delay(1000) ;LEDTOP_B_OFF;
+
+		for (int i = 0; i < 5; i++)
+		{
+			LEDTOP_R_BLINK; delay(1000);
+			LEDTOP_G_BLINK; delay(1000);
+			LEDTOP_B_BLINK; delay(1000);
+			
+		}
+				 
+		
+		LEDTOP_R_BREATH; delay(300);
+		LEDTOP_G_BREATH; delay(300);
+		LEDTOP_B_BREATH; delay(300);
+		
+ 	}
+#endif
+
+
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+///	SISTEMA ROBOT E VARIABILI GLOBALI
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+#include <MyRobotModelSmall.h>
+robot_t robot;
+float par_wheelDistance = ROBOT_WHEEL_DISTANCE;
+float par_motorsMinimumAbsoluteSpeed = 0.0;
+float par_motorsMaximumAbsoluteSpeed = 1.0;
+int par_blSpeedLimiterOn =0;
+
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+/// INTERFACCIA SENSORI 
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+#if 1
+	#include "std_msgs/String.h"	/// richiesto da msg;
+	#include "std_msgs/Bool.h"		/// richiesto da msg_pir;
+	#include "std_msgs/Int32.h"		/// richiesto da msg_bump;
+
+	/// GPIO Expander--------------------
+	int i2cHandler_gpio; 
+
+
+
+	std_msgs::String  g_onbumper_speech;
+	bool isSensorPirOn(){
+		return digitalRead(Pin_PIR)	;
+	}
+	bool isBumpForwardOn(){		// gli input sono pulled up a +vcc ; il bunber chiude a massa
+		return !digitalRead(Pin_BumbCenter)	;
+	}
+	bool isBumpLeftOn(){
+		return !digitalRead(Pin_BumbLeft)	;
+	}
+	bool isBumpRightOn(){
+		return !digitalRead(Pin_BumbRight)	;
+	}
+	
+	void ISRbumperFW_on(){
+		robot.sensors.bump.center = 1;	
+		//~ LEDTOP_R_ON;
+	}
+	void ISRbumperFW_off(){
+		robot.sensors.bump.center = 0;	
+		//~ LEDTOP_R_OFF;
+	}	
+	void ISRbumperL_on(){
+		robot.sensors.bump.left = 1;	
+		//~ LEDTOP_R_ON;
+	}
+	void ISRbumperL_off(){
+		robot.sensors.bump.left = 0;	
+		//~ LEDTOP_R_OFF;
+	}	
+	void ISRbumperR_on(){
+		robot.sensors.bump.right = 1;	
+		//~ LEDTOP_R_ON;
+	}
+	void ISRbumperR_off(){
+		robot.sensors.bump.right = 0;	
+		//~ LEDTOP_R_OFF;
+	}		
+	/*	void	checkSensors(ros::Publisher* pub)
+		{
+			ros::Time now = ros::Time::now();
+			double dt = (now - g_lastsensor_time).toSec();
+			if (dt > INTERVAL_GETSENSORS_SEC){
+
+				///-----------------------------------------------------
+				if (isSensorPirOn())
+				{
+					ROS_INFO("HUMAN DETECTED");	
+					
+					std_msgs::String msg;
+					msg.data = "Ciao chi sei ?";
+					pub->publish(msg);
+				}
+				
+				///------------------------------------------------------
+				g_lastsensor_time = now;
+			}
+		}
+	*/
+
+	/// Esegue la lettura dei vari sensori e mette  i dati nei messaggi
+	void fill_msg_sensors(std_msgs::Bool* msg_pir, std_msgs::Int32* msg_bump)
+	{
+		msg_pir->data = isSensorPirOn();
+		
+		msg_bump->data = 0;
+		
+		if (isBumpForwardOn())
+		{
+			msg_bump->data = 1;
+		}
+		if (isBumpRightOn())
+		{
+			msg_bump->data += (1 << 1) ;  /// set bit 2
+		}
+		if (isBumpLeftOn())
+		{
+			msg_bump->data +=(1 << 2 )  ; /// set bit 3
+		}	
+					
+	}
+	
+	
+	
+#endif
+
+
+
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+///  SYSINFO UPTIME                       
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+#if 1
+
+
+	//~ struct sysinfo {
+		//~ long uptime;             /* Seconds since boot */
+		//~ unsigned long loads[3];  /* 1, 5, and 15 minute load averages */
+		//~ unsigned long totalram;  /* Total usable main memory size */
+		//~ unsigned long freeram;   /* Available memory size */
+		//~ unsigned long sharedram; /* Amount of shared memory */
+		//~ unsigned long bufferram; /* Memory used by buffers */
+		//~ unsigned long totalswap; /* Total swap space size */
+		//~ unsigned long freeswap;  /* swap space still available */
+		//~ unsigned short procs;    /* Number of current processes */
+		//~ unsigned long totalhigh; /* Total high memory size */
+		//~ unsigned long freehigh;  /* Available high memory size */
+		//~ unsigned int mem_unit;   /* Memory unit size in bytes */
+		//~ char _f[20-2*sizeof(long)-sizeof(int)]; /* Padding for libc5 */
+	//~ };
+	//~ struct sysinfo pi3info;  /// richiede include sys/sysinfo.h
+
+	#include <linux/kernel.h>
+	//~ #include <linux/sys.h>
+	#include <stdio.h>
+	
+	//~ #include <sys/sysinfo.h>
+	#include  "sys/sysinfo.h"
+
+	int uptimeSec()
+	{
+		/* Conversion constants. */
+		const long minute = 60;
+		const long hour = minute * 60;
+		const long day = hour * 24;
+		const double megabyte = 1024 * 1024;
+		/* Obtain system statistics. */
+		struct sysinfo si;
+		sysinfo (&si);		
+
+		return si.uptime;
+	}
+
+	int sysInfo ()
+	{
+		/* Conversion constants. */
+		const long minute = 60;
+		const long hour = minute * 60;
+		const long day = hour * 24;
+		const double megabyte = 1024 * 1024;
+		/* Obtain system statistics. */
+		struct sysinfo si;
+		sysinfo (&si);
+		/* Summarize interesting values. */
+		printf ("system uptime : %ld days, %ld:%02ld:%02ld\n", 
+		 	si.uptime / day, (si.uptime % day) / hour, 
+		 	(si.uptime % hour) / minute, si.uptime % minute);
+		printf ("total RAM   : %5.1f MB\n", si.totalram / megabyte);
+		printf ("free RAM   : %5.1f MB\n", si.freeram / megabyte);
+		printf ("process count : %d\n", si.procs);
+		return 0;
+	}
+
+#endif
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+///	R O S
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+#if 1
+	//ros::NodeHandle nh; deve essere dichiarato dopo ros:::Init()
+
+	double rate = 10.0; // 5Hz main loop rate
+
+	double g_steps2m = ROBOT_STEPS2M;
+	double g_steps2rads = ROBOT_STEPS2RAD ;
+	double g_enc2steps = ROBOT_MOTOR_STEPS_PER_ENCODERTICK;
+	
+	/* 	// sostituiti da robot.cmdVel
+		double g_vel_x = 0.0;	
+		double g_vel_y = 0.0;	/// sempre 0
+		double g_vel_z = 0.0; ///rotazione
+	*/
+
+	// Variabili globali che registano la posizione /odom
+	double g_odom_x = 0.0;	
+	double g_odom_y = 0.0;	/// sempre 0
+	double g_odom_th = 0.0; ///rotazione
+
+	//odom_t robotOdom; // x,y rot rispetto mappa
+
+	double g_vel_dt = 0.0;
+	double g_imu_dt = 0.0;
+	double g_imu_z = 0.0;
+
+	ros::Time g_last_loop_time(0.0);
+	ros::Time g_last_vel_time(0.0);
+	ros::Time g_last_imu_time(0.0);
+
+	robotDir_e  imu_dir;
+	float speed_wish_right; 
+	float speed_wish_left;
+
+/* 	////////////////////////////////////////////////////////
+	/// limitatore di velocità spostato nella classe motore
+	////////////////////////////////////////////////////////
+	
+	int cmdVelLimit( geometry_msgs::Twist* cmdvel){
+		// float* targetVelocityLinear, float* targetVelocityAngular
+		
+		int res = 0;
+		if (fabs(cmdvel->linear.x) != 0){
+			if (fabs(cmdvel->linear.x) <  (float)MOTOR_MINIMUM_LINEAR_VELOCITY ){
+					cmdvel->linear.x = 0;
+					ROS_WARN("TARGET LINEAR SPEED TOO SLOW: DON'T MOVE ");	
+					res = -1;
+			}
+			else if (cmdvel->linear.x >  (float)MOTOR_MAXIMUM_LINEAR_VELOCITY ){
+					cmdvel->linear.x = (float)MOTOR_MAXIMUM_LINEAR_VELOCITY;
+					ROS_WARN("TARGET LINEAR SPEED TOO FAST, LIMITED TO:  x %f , r %f", robot.cmdVel.linear.x, robot.cmdVel.angular.z);				
+					res = 1;
+			}	
+			else if (cmdvel->linear.x <  -(float)MOTOR_MAXIMUM_LINEAR_VELOCITY ){
+					cmdvel->linear.x = -(float)MOTOR_MAXIMUM_LINEAR_VELOCITY;
+					ROS_WARN("TARGET LINEAR SPEED TOO FAST, LIMITED TO:  x %f , r %f", robot.cmdVel.linear.x, robot.cmdVel.angular.z);				
+					res = 1;
+			}			
+
+		}
+		if (fabs(cmdvel->angular.z) != 0){
+			if (fabs(cmdvel->angular.z) <  (float)MOTOR_MINIMUM_ANGULAR_VELOCITY ){
+					cmdvel->angular.z = 0;
+					ROS_WARN("TARGET ANGULAR SPEED TOO SLOW: DON'T ROTATE");	
+					res = -1;
+			}
+			else if (cmdvel->angular.z >  (float)MOTOR_MAXIMUM_ANGULAR_VELOCITY ){
+					cmdvel->angular.z = (float)MOTOR_MAXIMUM_ANGULAR_VELOCITY;
+					ROS_WARN("TARGET ANGULAR SPEED TOO FAST, LIMITED TO:  x %f , r %f", robot.cmdVel.linear.x, robot.cmdVel.angular.z);				
+					res = -1;
+			}			
+			else if (cmdvel->angular.z < -(float)MOTOR_MAXIMUM_ANGULAR_VELOCITY ){
+					cmdvel->angular.z = -(float)MOTOR_MAXIMUM_ANGULAR_VELOCITY;
+					ROS_WARN("TARGET ANGULAR SPEED TOO FAST, LIMITED TO:  x %f , r %f", robot.cmdVel.linear.x, robot.cmdVel.angular.z);				
+					res = -1;
+			}			
+		}
+		return res;		
+	}
+ */
+
+	//void cbk_cmdVel( const geometry_msgs::Twist& vel) {
+	void cbk_cmdVel2( const geometry_msgs::Twist& cmdvel) {
+		//callback every time the robot's linear velocity is received
+		ros::Time current_time = ros::Time::now();
+		robot.cmdVel = cmdvel;
+
+		speed_wish_right =robot.cmdVel.linear.x + (robot.cmdVel.angular.z*par_wheelDistance)/2  ;
+		speed_wish_left =robot.cmdVel.linear.x  - (robot.cmdVel.angular.z*par_wheelDistance)/2 ;
+
+
+
+		//ROS_INFO("cmd_vel  x %f , r %f", vel.linear.x, vel.angular.z);
+		ROS_DEBUG_THROTTLE(1,"cmd_vel  x %f , r %f", robot.cmdVel.linear.x, robot.cmdVel.angular.z);
+
+		ROS_DEBUG_THROTTLE(1,"\tRobot linear speed demand (rad/s) L %f , R %f \n", speed_wish_left, speed_wish_right);
+		/*
+				if (par_blSpeedLimiterOn){
+					
+					if (fabs(speed_wish_right) > par_motorsMaximumAbsoluteSpeed) {
+						speed_wish_right = sign(speed_wish_right) *par_motorsMaximumAbsoluteSpeed;
+						LEDTOP_R_ON;
+						LEDTOP_G_OFF;
+						LEDTOP_B_OFF;
+					}
+					else if (fabs(speed_wish_right) < par_motorsMinimumAbsoluteSpeed) {
+						speed_wish_right = sign(speed_wish_right) *par_motorsMinimumAbsoluteSpeed;
+						LEDTOP_R_OFF;
+						LEDTOP_G_OFF;
+						LEDTOP_B_ON;				
+					}else//non limita
+					{
+						LEDTOP_R_OFF;
+						LEDTOP_G_ON;
+						LEDTOP_B_OFF;			
+					}
+
+					if (fabs(speed_wish_left) > par_motorsMaximumAbsoluteSpeed) {
+						speed_wish_left =sign(speed_wish_left) *par_motorsMaximumAbsoluteSpeed;
+						LEDTOP_R_ON;
+						LEDTOP_G_OFF;
+						LEDTOP_B_OFF;
+					}
+					else if (fabs(speed_wish_left) < par_motorsMinimumAbsoluteSpeed) {
+						speed_wish_left = sign(speed_wish_left)* par_motorsMinimumAbsoluteSpeed;
+						LEDTOP_R_OFF;
+						LEDTOP_G_OFF;
+						LEDTOP_B_ON;				
+					}else//non limita
+					{
+						LEDTOP_R_OFF;
+						LEDTOP_G_ON;
+						LEDTOP_B_OFF;			
+					}
+
+
+				}
+		*/
+
+		if  (fabs(robot.cmdVel.linear.x)>0|| fabs(robot.cmdVel.angular.z) >0)		// movimento
+		{
+			if ( (!isBumpForwardOn()) && (!isBumpLeftOn())  && (!isBumpRightOn()) ){ // no bumpers
+							
+				mot_L.goCmdVel(speed_wish_left) ;	
+				mot_R.goCmdVel(speed_wish_right) ;	//  fattore -1 per tenere conto del motore ruotato di 180° rispetto all'altro
+				 
+				ROS_DEBUG_THROTTLE(1,"\nOK MOVING @Speed FW:%f , Rot:%f, \tLeft Speed %f, Right Speed %f \n",robot.cmdVel.linear.x, robot.cmdVel.angular.z,speed_wish_left,speed_wish_right);
+			}else
+			{
+				if (robot.cmdVel.linear.x < 0)
+				{
+					mot_L.goCmdVel(speed_wish_left) ;
+					mot_R.goCmdVel(speed_wish_right) ;	
+					ROS_INFO(" Mi muovo indietro, ma attenzione  ***  BUMPERS ATTIVATI ! ");
+					
+				}else
+				{
+					//robot.cmdVel.linear.x = 0; robot.cmdVel.angular.z =0;
+					mot_L.stop();	mot_R.stop();
+
+
+					ROS_INFO("  ***  BUMPERS ATTIVATI ! cmd_vel rifiutato  e mi fermo");
+					
+				}
+				
+				
+			
+			}
+		}else
+		{
+			ROS_DEBUG_THROTTLE(1,"MOT STOP\n");		
+			mot_L.stop();	mot_R.stop();		
+		}
+		
+
+		g_vel_dt = (current_time - g_last_vel_time).toSec();
+		g_last_vel_time = current_time;
+
+	}
+
+
+
+
+	/*
+		void initPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg){
+			tf2::Transform pose;
+			tf2::convert(msg->pose.pose, pose);
+			tf2_ros::Buffer* m_tfBuffer;
+
+			if (msg->header.frame_id != global_frame_id_){
+				ROS_WARN("Frame ID of \"initialpose\" (%s) is different from the global frame %s", msg->header.frame_id.c_str(), global_frame_id_.c_str());
+			}
+
+			// set offset so that current pose is set to "initialpose"    
+			geometry_msgs::TransformStamped baseInMap;
+			try{
+				// just get the latest
+				baseInMap = m_tfBuffer->lookupTransform(base_frame_id_, global_frame_id_, msg->header.stamp);
+			} catch(tf2::TransformException){
+				ROS_WARN("Failed to lookup transform!");
+				return;
+			}
+
+			tf2::Transform baseInMapTf2;
+			tf2::convert(baseInMap.transform, baseInMapTf2);
+			tf2::Transform delta = pose * baseInMapTf2;
+			m_offsetTf = delta * m_offsetTf;
+
+		}
+	*/
+
+	/// ////////////////////////////////////////////////////////////////////////////////////////////	
+	/// ////////////////////////////////////////////////////////////////////////////////////////////	
+	/// R O S    publish Sensors
+	/// ////////////////////////////////////////////////////////////////////////////////////////////	
+	/// ////////////////////////////////////////////////////////////////////////////////////////////	
+	#define INTERVAL_GETSENSORS_SEC 3
+	ros::Time g_lastsensor_time;
+
+
+	/// ///////////////////////////////////////////////////////////////////
+	/// ///////////////////////////////////////////////////////////////////
+	///	R O S 		O D O M
+	/// ///////////////////////////////////////////////////////////////////
+	/// ///////////////////////////////////////////////////////////////////
+	#include <ros/ros.h>
+	#include <tf/transform_broadcaster.h>
+	#include <nav_msgs/Odometry.h>
+
+	ros::Time current_time;
+	static ros::Time last_time_odometryUpdated;
+
+
+
+#endif //ROS
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+///	GLOBAL FUNCTIONS
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+#if 1
+	void hwTest(float vel = 0.4, float time_ms = 2000){
+
+		///---------------------------------------------------------------
+		/// Eventuali test iniziali
+		///---------------------------------------------------------------
+
+
+
+	
+		dbg("\n ------------Testing motors-----------");	
+		/// CCW
+		;
+		dbg2("\n CW @%f rad/s -----------",vel);	
+
+		mot_L.goCmdVel(vel);
+		mot_R.goCmdVel(-vel);
+		delay(time_ms);
+		
+		
+		dbg2("\n CCW @%f rad/s-----------",vel);	
+
+		mot_L.goCmdVel(-vel);
+		mot_R.goCmdVel(vel);
+		delay(time_ms);
+		
+		
+		/// STOP
+		dbg("\n stop-----------");	
+		mot_L.stop();		
+		mot_R.stop();
+
+	}
+	
+	void ledSequence(int rms, int gms, int bms){
+		if (rms > 0)
+		{
+			LEDTOP_R_ON
+			delay(rms);
+			LEDTOP_R_OFF
+		}
+		if (gms > 0)
+		{
+			LEDTOP_G_ON
+			delay(gms);
+			LEDTOP_G_OFF
+		}
+		
+		if (gms > 0)
+		{
+			LEDTOP_B_ON
+			delay(bms);
+			LEDTOP_B_OFF
+		}
+			
+	}
+
+
+
+	int setup_HW(){
+		printf("\n HW init...\n");
+		
+	
+		if (wiringPiSetup()!=-1 )
+		{
+			printf("\n OK wiringPiSetup \n ");
+		}else
+		{
+			printf("\n\n\n*********************\n wiringPiSetup  KO !!!  \n  error no:%d *********************\n\n\n",errno);
+			return 1;
+			
+		}
+		
+
+
+		
+		//Serial-------------------
+		#define serialDevice "/dev/serial0"
+		int fd = serialOpen (serialDevice, 115200);
+		
+		if (fd < 0)
+		{
+			fprintf (stderr, "Unable to open serial device: %s \nError: %s\n",serialDevice, strerror (errno)) ;
+			return -1 ;
+		}else
+		{
+			mot_L.init(fd);
+			mot_R.init(fd);
+			
+		}
+		
+
+		if (setup_GPIOexp() !=0)
+		{
+
+			printf("\n FAILED CONNECTING GPIOEXPANDER !!! HALT");
+			return -1 ;
+			
+		}else
+		{
+			printf("\n OK SETUP GPIOEXPANDER ");
+			
+		}
+		
+		
+
+		ledSequence(400,400,400);
+		
+		//~ if (gpioInitialise() < 0)
+		//~ {
+		 //~ std::cout << "pigpio initialisation failed."<< std::endl;  // pigpio initialisation failed.
+		 //~ std::cout << "prova a fare: sudo killall pigpiod  , e pio riprova"<< std::endl;
+		//~ }	
+		
+		initRobotBaseHW();
+				
+		
+		/// ISR ------------------------------------------------------
+		wiringPiISR(Pin_BumbCenter, INT_EDGE_FALLING, &ISRbumperFW_on);
+		wiringPiISR(Pin_BumbCenter, INT_EDGE_RISING,  &ISRbumperFW_off);
+		wiringPiISR(Pin_BumbLeft,   INT_EDGE_FALLING, &ISRbumperL_on);
+		wiringPiISR(Pin_BumbLeft,   INT_EDGE_RISING,  &ISRbumperL_off);
+		wiringPiISR(Pin_BumbRight,  INT_EDGE_FALLING, &ISRbumperR_on);
+		wiringPiISR(Pin_BumbRight,  INT_EDGE_RISING,  &ISRbumperR_off);
+
+
+
+
+		
+		
+		// Check for bumpers free
+		while (isBumpForwardOn()||isBumpLeftOn()||isBumpRightOn())
+		{
+			printf("\nWarning uno dei Bumbers risulta premuto ");
+			if (isBumpForwardOn())
+			{
+				printf("\n\tBumber anteriore premuto");
+			}
+			if (isBumpLeftOn())
+			{
+				printf("\n\tBumber Left premuto");
+			}			
+			if (isBumpRightOn())
+			{
+				printf("\n\tBumber Left premuto");
+			}
+			delay(3000);
+		}
+		
+		
+	}
+
+	void hwShutdown(){
+		/// stop degli altri threads
+		mot_L.stop();
+		mot_R.stop();
+		int i = 0;
+
+		
+		LEDTOP_ALL_OFF ;
+		LEDTOP_R_BLINK;
+		
+
+	}
+
+
+	/// pubblica regolarmente alcuni dati -------------------------------------------
+	#define INTERVAL_INFO_POS_SEC 1
+	ros::Time g_last_info_time;
+	
+	void publish_info(ros::Time current_time){
+		/// Invio a bassa frequenza info
+		double dt = (current_time - g_last_info_time).toSec();
+		if (dt > INTERVAL_INFO_POS_SEC){
+		
+			printf("\n DIR IMU %d", imu_dir);
+			///---------------------------------------------------------
+			//~ printf("odom.x: [%f], y: [%f], r: [%f]",robotOdom.x,robotOdom.y ,robotOdom.r);	
+			//~ ROS_INFO("cmd_vel lin:%f , rot: %f", vel.linear.x, vel.angular.z);
+
+			///---------------------------------------------------------
+			g_last_info_time = current_time;
+		}
+	}
+
+	/*	void say(std_msgs::String msg){
+		pub_chatter.publish(msg);
+	}*/	
+
+#endif
+
+
+
+
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+///	M A I N
+/// ///////////////////////////////////////////////////////////////////
+/// ///////////////////////////////////////////////////////////////////
+int main(int argc, char** argv){
+	printf("\n\n-------------------------------------\n DC MOTOR CONTROLLER \n\n----------------------------------------\n ");
+	#if 1  ///S E T U P 	 HW, ROS
+		/// ////////////////////////////////////////////////////////////////////////////////////////////	
+		/// ////////////////////////////////////////////////////////////////////////////////////////////	
+		/// H A R D W A R E  S E T U P 
+		/// ////////////////////////////////////////////////////////////////////////////////////////////	
+		/// ////////////////////////////////////////////////////////////////////////////////////////////	
+
+		
+		 // vedi https://projects.drogon.net/raspberry-pi/wiringpi/functions/
+		if (setup_HW()==-1){
+			printf("\n\n\n*********************\n FALLITO SETUP_HW - PROGRAMMA ABORTITO \n*********************\n\n\n",errno);
+			return -1;		
+		}else
+		{
+			printf(" HW SETUP OK\n");
+		}
+		
+
+
+		
+		/// ////////////////////////////////////////////////////////////////////////////////////////////	
+		/// ////////////////////////////////////////////////////////////////////////////////////////////	
+		/// R O S  S E T U P 
+		/// ////////////////////////////////////////////////////////////////////////////////////////////	
+		/// ////////////////////////////////////////////////////////////////////////////////////////////	
+		ros::init(argc, argv, NODENAME); ///must be called before creating a node handle
+		ros::NodeHandle nh; 
+		ros::NodeHandle _nh("~"); //nodo privato per il caricamento dei parametri
+
+
+
+		/// ///////////////////////////////////////////////////////////////
+		/// ///////////////////////////////////////////////////////////////
+		///								
+		///	LOAD PARAMETERS					
+		///								
+		/// ///////////////////////////////////////////////////////////////
+		/// ////////////////////////////////////////////////////////////////
+		#if 1
+
+			#define LOAD_PARAMETER_FLOAT(PN,PV,D)  			if (_nh.getParam(PN, PV)){	    printf("\n loaded param: %s=%f ",PN, PV);}else{	PV = D;	printf("\n\tWarning parameter [%s] not found. using default value:  %f ",PN, PV);}
+			#define LOAD_PARAMETER_BOOL(PN,PV,D)  			if (_nh.getParam(PN, PV)){	    printf("\n loaded param: %s=%d ",PN, PV);}else{	PV = D;	printf("\n\t Warning, parameter [%s] not found. Using default value: %s ",PN ,PV ? "true" : "false"  );}
+			#define LOAD_PARAMETER_MSGSTRING(PN,PV,D)  		if (_nh.getParam(PN, PV.data)){	printf("\n loaded param: %s=%s ",PN, PV.data.c_str() );}else{	PV.data = D;	printf("\n\t Warning, parameter [%s] not found. Using default value: %s ",PN ,PV.data.c_str()   );}
+
+
+			//#define LOAD_PARAMETER_STRING(PN,PV,D)  		if (nh.getParam(thisNs+"/"+thisNode+"/"+PN, PV)){	printf("\n loaded param: %s=%s ",PN, PV.c_str() );}else{	PV =String( D);	printf("\n\t Warning, parameter [%s] not found. Using default value: %s ",PN ,PV.c_str()   );}
+			printf("\n -------------------------------Loading parameters -------------------------------");
+
+
+
+			/// Setting a parameter value during a launch file 
+			/// <param name="param-name" value="param-value" />
+			
+			
+			/// Load Rate -----------------------------------------------------------		
+			LOAD_PARAMETER_FLOAT("rate",rate, 10); 	
+			ros::Rate r(rate);			
+
+			LOAD_PARAMETER_BOOL("bl_speedlimiter_on",par_blSpeedLimiterOn,1);
+			
+			
+			mot_L.setLimiter(0);//mot_L.setLimiter(par_blSpeedLimiterOn);
+			mot_R.setLimiter(0);//mot_R.setLimiter(par_blSpeedLimiterOn);
+
+			int blMakeTest ;
+			LOAD_PARAMETER_BOOL("bl_maketest",blMakeTest,1);
+
+
+			/// messaggio in caso di bumpers attivati    ---------------------------------------------
+			LOAD_PARAMETER_MSGSTRING("onbumper_speech",g_onbumper_speech,"sorry" );
+
+
+			float par_testVel ;
+			float par_testTimeMs;
+			LOAD_PARAMETER_FLOAT("test_vel",par_testVel, 0.7); 	
+			LOAD_PARAMETER_FLOAT("test_time_ms",par_testTimeMs, 3000); 	
+			LOAD_PARAMETER_FLOAT("wheel_distance",par_wheelDistance,  ROBOT_WHEEL_DISTANCE ); 	
+			LOAD_PARAMETER_FLOAT("mot_rotspeed_abs_min",par_motorsMinimumAbsoluteSpeed,  0.12 ); 	
+			LOAD_PARAMETER_FLOAT("mot_rotspeed_abs_max",par_motorsMaximumAbsoluteSpeed,  1.0 ); 	
+			
+			
+
+				
+			printf("\n -------------------------------End loading parameters --------");
+
+			
+		#endif
+		///---------------------------------------------------------------
+		/// test motori
+		///---------------------------------------------------------------		
+		if (blMakeTest) {
+			hwTest(par_testVel, par_testTimeMs);
+		}
+		
+
+		///---------------------------------------------------------------
+		/// ROS Subscriber 
+		///---------------------------------------------------------------
+		robot.cmdVel.linear.y = 0;
+		ros::Subscriber sub_cmd_vel = nh.subscribe("/cmd_vel", 1, cbk_cmdVel2);
+
+	
+		///---------------------------------------------------------------
+		/// ROS Publisher 
+		///---------------------------------------------------------------
+
+		std_msgs::Bool	msg_pir;
+		ros::Publisher pub_pir = nh.advertise<std_msgs::Bool>("/pir", 10);
+		
+		std_msgs::Int32	msg_bump;
+		ros::Publisher pub_bump = nh.advertise<std_msgs::Int32>("/bump", 10);
+		msg_bump.data = 0x0;
+		
+		std_msgs::Float32	msg_targetVelL;
+		std_msgs::Float32	msg_targetVelR;
+		ros::Publisher pub_targetVelL = nh.advertise<std_msgs::Float32>("/lwheel_vtarget", 10);
+		ros::Publisher pub_targetVelR = nh.advertise<std_msgs::Float32>("/rwheel_vtarget", 10);
+
+		LEDTOP_R_OFF
+		LEDTOP_G_ON  // segnale READY
+
+
+		
+	#endif
+	
+	/// ////////////////////////////////////////////////////////////////////////////////////////////	
+	/// ////////////////////////////////////////////////////////////////////////////////////////////	
+	/// R O S  L O O P 
+	/// ////////////////////////////////////////////////////////////////////////////////////////////	
+	/// ////////////////////////////////////////////////////////////////////////////////////////////	
+	
+	ros::Duration battery_interval(5.0); // 5sec
+	ros::Time battery_time_last = ros::Time::now();
+	
+	ros::Duration deltaTime(0.0); // 5sec
+
+	bool blMovingBackDueToObstacle = false;
+	ros::Time backRecoveryMotionStartTime ;
+
+	while(nh.ok() && !kbhit()){
+		ros::spinOnce();
+		ros::Time current_loop_time = ros::Time::now();
+
+
+		
+		/// lettura sensori----------------------------------------
+		fill_msg_sensors( &msg_pir, &msg_bump);
+
+		
+		if (msg_bump.data > 0)
+		{
+			ROS_INFO("WARNING BUMBERS ON %d ",msg_bump.data);
+			mot_L.stop();
+			mot_R.stop();
+			
+			pub_targetVelR.publish(msg_targetVelL);
+
+			robot.cmdVel.linear.x =-(float)(MOTOR_MINIMUM_LINEAR_VELOCITY*2);
+			robot.cmdVel.angular.z = 0;
+			ROS_WARN("Going back for 0.5s @0.1m/s due to bumpers...");
+
+			blMovingBackDueToObstacle = true;
+			backRecoveryMotionStartTime = ros::Time::now();
+			cbk_cmdVel2( const_cast<geometry_msgs::Twist&>(robot.cmdVel) );
+
+		}
+
+		ros::Time time_now = ros::Time::now();
+
+		if (blMovingBackDueToObstacle)
+		{
+			deltaTime =(time_now - backRecoveryMotionStartTime  );
+			if (deltaTime.toSec() > 1.5 )
+			{
+				// dop 1.5 sec mi fermo e restto il flag blMovingBackDueToObstacle
+				robot.cmdVel.linear.x = 0;
+				robot.cmdVel.angular.z = 0;		
+				
+				cbk_cmdVel2( const_cast<geometry_msgs::Twist&>(robot.cmdVel) );
+				
+				blMovingBackDueToObstacle = false;
+			}
+			
+		}
+
+
+
+	
+	
+		/// Pubblico movimento PIR--------------------------------------
+		pub_pir.publish(msg_pir);
+		
+		/// Pubblico stato dei bumpers----------------------------------
+		pub_bump.publish(msg_bump);
+		
+
+		g_last_loop_time = current_loop_time;
+		r.sleep();
+		
+	}
+	(void)getch(); /* consume the character */
+	hwShutdown();
+
+}
